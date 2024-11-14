@@ -4672,6 +4672,7 @@ static public class FnExpr extends ObjExpr{
 }
 
 static public class ObjExpr implements Expr{
+	boolean batch_init = true;
 	static final String CONST_PREFIX = "const__";
 	String name;
 	//String simpleName;
@@ -4815,6 +4816,7 @@ static public class ObjExpr implements Expr{
 	}
 
 	void compile(String superName, String[] interfaceNames, boolean oneTimeUse) throws IOException{
+		batch_init = false;
 		//create bytecode for a class
 		//with name current_ns.defname[$letname]+
 		//anonymous fns get names fn__id
@@ -4824,7 +4826,7 @@ static public class ObjExpr implements Expr{
 		ClassVisitor cv = cw;
 //		ClassVisitor cv = new TraceClassVisitor(new CheckClassAdapter(cw), new PrintWriter(System.out));
 		//ClassVisitor cv = new TraceClassVisitor(cw, new PrintWriter(System.out));
-		cv.visit(V1_8, ACC_PUBLIC + ACC_SUPER + ACC_FINAL, internalName, null,superName,interfaceNames);
+		cv.visit(V17, ACC_PUBLIC + ACC_SUPER + ACC_FINAL, internalName, null,superName,interfaceNames);
 //		         superName != null ? superName :
 //		         (isVariadic() ? "clojure/lang/RestFn" : "clojure/lang/AFunction"), null);
 		String source = (String) SOURCE.deref();
@@ -5722,9 +5724,21 @@ static public class ObjExpr implements Expr{
 
 	public void emitConstant(GeneratorAdapter gen, int id){
         usedConstants = (IPersistentSet) usedConstants.cons(id);
-		gen.getStatic(objtype, constantName(id), constantType(id));
+		gen.getStatic(constantContainer(id), constantName(id), constantType(id));
 	}
 
+	public static final int INITS_PER = 100;
+
+	public Type constantContainer(int id) {
+		if (!batch_init)
+			return objtype;
+		else
+			return Type.getObjectType(objtype.getInternalName() + "$" + constantContainerName(id));
+	}
+
+	public String constantContainerName(int id) {
+		return "ID_" + (id / INITS_PER);
+	}
 
 	String constantName(int id){
 		return CONST_PREFIX + id;
@@ -8308,7 +8322,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		objx.objtype = Type.getObjectType(objx.internalName);
 		ClassWriter cw = classWriter();
 		ClassVisitor cv = cw;
-		cv.visit(V1_8, ACC_PUBLIC + ACC_SUPER, objx.internalName, null, "java/lang/Object", null);
+		cv.visit(V17, ACC_PUBLIC + ACC_SUPER, objx.internalName, null, "java/lang/Object", null);
 
 		//static load method
 		GeneratorAdapter gen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
@@ -8332,14 +8346,6 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		gen.returnValue();
 		gen.endMethod();
 
-		//static fields for constants
-		for(int i = 0; i < objx.constants.count(); i++)
-			{
-            if(objx.usedConstants.contains(i))
-			    cv.visitField(ACC_PUBLIC + ACC_FINAL + ACC_STATIC, objx.constantName(i), objx.constantType(i).getDescriptor(),
-			              null, null);
-			}
-
 		final int INITS_PER = 100;
 		int numInits =  objx.constants.count() / INITS_PER;
 		if(objx.constants.count() % INITS_PER != 0)
@@ -8347,11 +8353,32 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 
 		for(int n = 0;n<numInits;n++)
 			{
+			int containerStart = n * INITS_PER;
+			Type inner_type = objx.constantContainer(containerStart);
+
+			cv.visitInnerClass(inner_type.getInternalName(),
+					   objx.objtype.getInternalName(),
+					   objx.constantContainerName(containerStart),
+					   ACC_STATIC + ACC_FINAL);
+
+				ClassWriter inner_cw = classWriter();
+				ClassVisitor inner_cv = inner_cw;
+				inner_cv.visit(V17, ACC_PUBLIC + ACC_SUPER, inner_type.getInternalName(), null, "java/lang/Object", null);
+
+				//static fields for constants
+				for(int i = n*INITS_PER; i < objx.constants.count() && i < (n+1)*INITS_PER; i++)
+				{
+					if(objx.usedConstants.contains(i))
+						inner_cv.visitField(ACC_PUBLIC + ACC_FINAL + ACC_STATIC, objx.constantName(i), objx.constantType(i).getDescriptor(),
+								null, null);
+				}
+
 			GeneratorAdapter clinitgen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
-			                                                  Method.getMethod("void __init" + n + "()"),
-			                                                  null,
-			                                                  null,
-			                                                  cv);
+					Method.getMethod("void <clinit> ()"),
+					                 null,
+					                 null,
+					                 inner_cv);
+
 			clinitgen.visitCode();
 			try
 				{
@@ -8363,7 +8390,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
                         {
                         objx.emitValue(objx.constants.nth(i), clinitgen);
                         clinitgen.checkCast(objx.constantType(i));
-                        clinitgen.putStatic(objx.objtype, objx.constantName(i), objx.constantType(i));
+                        clinitgen.putStatic(objx.constantContainer(i), objx.constantName(i), objx.constantType(i));
                         }
 					}
 				}
@@ -8373,6 +8400,8 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 				}
 			clinitgen.returnValue();
 			clinitgen.endMethod();
+			inner_cv.visitEnd();
+			writeClassFile(inner_type.getInternalName(), inner_cw.toByteArray());
 			}
 
 		//static init for constants, keywords and vars
@@ -8391,8 +8420,6 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 //			{
 //			objx.emitConstants(clinitgen);
 //			}
-		for(int n = 0;n<numInits;n++)
-			clinitgen.invokeStatic(objx.objtype, Method.getMethod("void __init" + n + "()"));
 
 		clinitgen.push(objx.internalName.replace('/','.'));
 		clinitgen.invokeStatic(RT_TYPE, Method.getMethod("Class classForName(String)"));
@@ -8628,7 +8655,7 @@ static public class NewInstanceExpr extends ObjExpr{
 	static Class compileStub(String superName, NewInstanceExpr ret, String[] interfaceNames, Object frm){
 	    ClassWriter cw = classWriter();
 	    ClassVisitor cv = cw;
-		cv.visit(V1_8, ACC_PUBLIC + ACC_SUPER, COMPILE_STUB_PREFIX + "/" + ret.internalName,
+		cv.visit(V17, ACC_PUBLIC + ACC_SUPER, COMPILE_STUB_PREFIX + "/" + ret.internalName,
 		         null,superName,interfaceNames);
 
 		//instance fields for closed-overs

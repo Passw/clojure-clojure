@@ -4786,6 +4786,7 @@ static public class ObjExpr implements Expr{
 
 	private DynamicClassLoader loader;
 	private byte[] bytecode;
+	private Map<String, byte[]> constFieldBytecode;
 
 	public ObjExpr(Object tag){
 		this.tag = tag;
@@ -5096,14 +5097,7 @@ static public class ObjExpr implements Expr{
 		emitStatics(cv);
 		emitMethods(cv);
 
-        //static fields for constants
-        for(int i = 0; i < constants.count(); i++)
-            {
-            if(usedConstants.contains(i))
-                cv.visitField(ACC_PUBLIC + ACC_FINAL
-                          + ACC_STATIC, constantName(i), constantType(i).getDescriptor(),
-                          null, null);
-            }
+        emitConstantFields(cv);
 
         //static fields for lookup sites
         for(int i = 0; i < keywordCallsites.count(); i++)
@@ -5123,11 +5117,6 @@ static public class ObjExpr implements Expr{
                                                           cv);
         clinitgen.visitCode();
         clinitgen.visitLineNumber(line, clinitgen.mark());
-
-        if(constants.count() > 0)
-            {
-            emitConstants(clinitgen);
-            }
 
         if(keywordCallsites.count() > 0)
             emitKeywordCallsites(clinitgen);
@@ -5183,8 +5172,16 @@ static public class ObjExpr implements Expr{
 		cv.visitEnd();
 
 		bytecode = cw.toByteArray();
-		if(RT.booleanCast(COMPILE_FILES.deref()))
+		if(RT.booleanCast(COMPILE_FILES.deref())) {
 			writeClassFile(internalName, bytecode);
+			if (constFieldBytecode != null) {
+                for (Map.Entry<String, byte[]> entry : constFieldBytecode.entrySet()) {
+                    String constName = entry.getKey();
+                    byte[] constBytecode = entry.getValue();
+                    writeClassFile(constName, constBytecode);
+                }
+            }
+		}
 //		else
 //			getCompiledClass();
 	}
@@ -5438,26 +5435,62 @@ static public class ObjExpr implements Expr{
 			}
 	}
 
+	public static final int INITS_PER = 100;
 
-	void emitConstants(GeneratorAdapter clinitgen){
-		try
-			{
-			Var.pushThreadBindings(RT.map(RT.PRINT_DUP, RT.T));
+	void emitConstantFields(ClassVisitor cv) throws IOException {
+		if (constants.count() > 0) {
+			Map<String, byte[]> tempFieldBytecode = new HashMap<>();
+			int numInits = constants.count() / INITS_PER;
+			if (constants.count() % INITS_PER != 0)
+				++numInits;
 
-			for(int i = 0; i < constants.count(); i++)
-				{
-                if(usedConstants.contains(i))
-                    {
-                    emitValue(constants.nth(i), clinitgen);
-                    clinitgen.checkCast(constantType(i));
-                    clinitgen.putStatic(objtype, constantName(i), constantType(i));
-                    }
+			for (int n = 0; n < numInits; n++) {
+				int containerStart = n * INITS_PER;
+				Type inner_type = constantContainer(containerStart);
+
+				cv.visitInnerClass(inner_type.getInternalName(),
+						objtype.getInternalName(),
+						constantContainerName(containerStart),
+						ACC_STATIC + ACC_FINAL);
+
+				ClassWriter inner_cw = classWriter();
+				ClassVisitor inner_cv = inner_cw;
+				inner_cv.visit(V1_8, ACC_PUBLIC + ACC_SUPER, inner_type.getInternalName(), null, "java/lang/Object", null);
+
+				//static fields for constants
+				for (int i = n * INITS_PER; i < constants.count() && i < (n + 1) * INITS_PER; i++) {
+					if (usedConstants.contains(i))
+						inner_cv.visitField(ACC_PUBLIC + ACC_FINAL + ACC_STATIC, constantName(i), constantType(i).getDescriptor(),
+								null, null);
 				}
+
+				GeneratorAdapter clinitgen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
+						Method.getMethod("void <clinit> ()"),
+						null,
+						null,
+						inner_cv);
+
+				clinitgen.visitCode();
+				try {
+					Var.pushThreadBindings(RT.map(RT.PRINT_DUP, RT.T));
+
+					for (int i = n * INITS_PER; i < constants.count() && i < (n + 1) * INITS_PER; i++) {
+						if (usedConstants.contains(i)) {
+							emitValue(constants.nth(i), clinitgen);
+							clinitgen.checkCast(constantType(i));
+							clinitgen.putStatic(constantContainer(i), constantName(i), constantType(i));
+						}
+					}
+				} finally {
+					Var.popThreadBindings();
+				}
+				clinitgen.returnValue();
+				clinitgen.endMethod();
+				inner_cv.visitEnd();
+				tempFieldBytecode.put(inner_type.getInternalName(), inner_cw.toByteArray());
 			}
-		finally
-			{
-			Var.popThreadBindings();
-			}
+			constFieldBytecode = tempFieldBytecode;
+		}
 	}
 
 	boolean isMutable(LocalBinding lb){
@@ -5500,6 +5533,10 @@ static public class ObjExpr implements Expr{
 //			else
 				{
 				loader = (DynamicClassLoader) LOADER.deref();
+				if (constFieldBytecode != null)
+					constFieldBytecode.forEach((constName, constBytecode) -> {
+						loader.defineClass(constName.replace("/", "."), constBytecode, src);
+					});
 				compiledClass = loader.defineClass(name, bytecode, src);
 				}
 		return compiledClass;
@@ -5650,7 +5687,7 @@ static public class ObjExpr implements Expr{
                         {
 //                        System.out.println("use: " + rep);
                         }
-                    }     
+                    }
 				}
 			else
 				{
@@ -5722,9 +5759,16 @@ static public class ObjExpr implements Expr{
 
 	public void emitConstant(GeneratorAdapter gen, int id){
         usedConstants = (IPersistentSet) usedConstants.cons(id);
-		gen.getStatic(objtype, constantName(id), constantType(id));
+		gen.getStatic(constantContainer(id), constantName(id), constantType(id));
 	}
 
+	public Type constantContainer(int id) {
+		return Type.getObjectType(objtype.getInternalName() + "$" + constantContainerName(id));
+	}
+
+	public String constantContainerName(int id) {
+		return "ID_" + (id / INITS_PER);
+	}
 
 	String constantName(int id){
 		return CONST_PREFIX + id;
@@ -8332,48 +8376,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		gen.returnValue();
 		gen.endMethod();
 
-		//static fields for constants
-		for(int i = 0; i < objx.constants.count(); i++)
-			{
-            if(objx.usedConstants.contains(i))
-			    cv.visitField(ACC_PUBLIC + ACC_FINAL + ACC_STATIC, objx.constantName(i), objx.constantType(i).getDescriptor(),
-			              null, null);
-			}
-
-		final int INITS_PER = 100;
-		int numInits =  objx.constants.count() / INITS_PER;
-		if(objx.constants.count() % INITS_PER != 0)
-			++numInits;
-
-		for(int n = 0;n<numInits;n++)
-			{
-			GeneratorAdapter clinitgen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
-			                                                  Method.getMethod("void __init" + n + "()"),
-			                                                  null,
-			                                                  null,
-			                                                  cv);
-			clinitgen.visitCode();
-			try
-				{
-				Var.pushThreadBindings(RT.map(RT.PRINT_DUP, RT.T));
-
-				for(int i = n*INITS_PER; i < objx.constants.count() && i < (n+1)*INITS_PER; i++)
-					{
-                    if(objx.usedConstants.contains(i))
-                        {
-                        objx.emitValue(objx.constants.nth(i), clinitgen);
-                        clinitgen.checkCast(objx.constantType(i));
-                        clinitgen.putStatic(objx.objtype, objx.constantName(i), objx.constantType(i));
-                        }
-					}
-				}
-			finally
-				{
-				Var.popThreadBindings();
-				}
-			clinitgen.returnValue();
-			clinitgen.endMethod();
-			}
+		objx.emitConstantFields(cv);
 
 		//static init for constants, keywords and vars
 		GeneratorAdapter clinitgen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
@@ -8386,13 +8389,6 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		Label endTry = clinitgen.newLabel();
 		Label end = clinitgen.newLabel();
 		Label finallyLabel = clinitgen.newLabel();
-
-//		if(objx.constants.count() > 0)
-//			{
-//			objx.emitConstants(clinitgen);
-//			}
-		for(int n = 0;n<numInits;n++)
-			clinitgen.invokeStatic(objx.objtype, Method.getMethod("void __init" + n + "()"));
 
 		clinitgen.push(objx.internalName.replace('/','.'));
 		clinitgen.invokeStatic(RT_TYPE, Method.getMethod("Class classForName(String)"));
@@ -8418,7 +8414,12 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		//end of class
 		cv.visitEnd();
 
-		writeClassFile(objx.internalName, cw.toByteArray());
+            for (Map.Entry<String, byte[]> entry : objx.constFieldBytecode.entrySet()) {
+                String constName = entry.getKey();
+                byte[] constBytecode = entry.getValue();
+                writeClassFile(constName, constBytecode);
+            }
+            writeClassFile(objx.internalName, cw.toByteArray());
 		}
 	catch(LispReader.ReaderException e)
 		{
